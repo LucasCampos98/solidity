@@ -32,6 +32,49 @@ using namespace solidity;
 using namespace solidity::langutil;
 using namespace solidity::frontend;
 
+namespace {
+
+void copyMissingTags(StructurallyDocumentedAnnotation& _target, CallableDeclarationAnnotation const& _source)
+{
+	auto& sourceDoc = dynamic_cast<StructurallyDocumentedAnnotation const&>(_source);
+
+	for (auto iterator = sourceDoc.docTags.cbegin(); iterator != sourceDoc.docTags.cend();)
+		if (_target.docTags.count(iterator->first) || iterator->first == "inheritdoc")
+			iterator++;
+		else
+			for (auto nextTag = sourceDoc.docTags.upper_bound(iterator->first); iterator != nextTag; iterator++)
+				_target.docTags.emplace(iterator->first, iterator->second);
+}
+
+CallableDeclaration const* findBaseCallable(CallableDeclaration const& _callable, string const& _name)
+{
+	for (CallableDeclaration const* baseFuncCandidate: _callable.annotation().baseFunctions)
+		if (baseFuncCandidate->annotation().contract->name() == _name)
+			return baseFuncCandidate;
+		else if (auto callable = findBaseCallable(*baseFuncCandidate, _name))
+			return callable;
+
+	return nullptr;
+}
+
+bool parameterNamesEqual(CallableDeclaration const& _a, CallableDeclaration const& _b)
+{
+	std::vector<ASTPointer<VariableDeclaration>> const& aParams = _a.parameters();
+	std::vector<ASTPointer<VariableDeclaration>> const& bParams = _b.parameters();
+
+	return equal(
+		aParams.cbegin(),
+		aParams.cend(),
+		bParams.cbegin(),
+		[](ASTPointer<VariableDeclaration> const _a, ASTPointer<VariableDeclaration> const _b) -> bool
+		{
+			return _a->name() == _b->name();
+		}
+	);
+}
+
+}
+
 bool DocStringAnalyser::analyseDocStrings(SourceUnit const& _sourceUnit)
 {
 	auto errorWatcher = m_errorReporter.errorWatcher();
@@ -139,9 +182,55 @@ void DocStringAnalyser::handleCallable(
 	StructurallyDocumentedAnnotation& _annotation
 )
 {
-	static set<string> const validTags = set<string>{"author", "dev", "notice", "return", "param"};
+	static set<string> const validTags = set<string>{"author", "dev", "notice", "return", "param", "inheritdoc"};
 	parseDocStrings(_node, _annotation, validTags, "functions");
 	checkParameters(_callable, _node, _annotation);
+
+	if (CallableDeclaration const* baseFunction = resolveInheritDoc(_callable, _node, _annotation))
+		copyMissingTags(_annotation, baseFunction->annotation());
+	else if (
+		_annotation.docTags.empty() &&
+		_callable.annotation().baseFunctions.size() == 1 &&
+		parameterNamesEqual(_callable, **_callable.annotation().baseFunctions.begin())
+	)
+		copyMissingTags(_annotation, (*_callable.annotation().baseFunctions.begin())->annotation());
+}
+
+CallableDeclaration const* DocStringAnalyser::resolveInheritDoc(
+	CallableDeclaration const& _callable,
+	StructurallyDocumented const& _node,
+	StructurallyDocumentedAnnotation& _annotation
+)
+{
+	size_t const occurrences = _annotation.docTags.count("inheritdoc");
+
+	if (occurrences == 0)
+		return nullptr;
+
+	if (occurrences > 1)
+	{
+		m_errorReporter.docstringParsingError(
+			5142_error,
+			_node.documentation()->location(),
+			"Documentation tag @inheritdoc can only reference one contract."
+		);
+		return nullptr;
+	}
+
+	string const targetContractName = _annotation.docTags.find("inheritdoc")->second.content;
+
+	if (auto callable = findBaseCallable(_callable, targetContractName))
+		return callable;
+
+	m_errorReporter.docstringParsingError(
+		1430_error,
+		_node.documentation()->location(),
+		"Documentation tag @inheritdoc references contract \"" +
+		targetContractName +
+		"\", but the contract doesn't override this function."
+	);
+
+	return nullptr;
 }
 
 void DocStringAnalyser::parseDocStrings(
